@@ -222,22 +222,43 @@ func (h *Handler) Handle(down *layer4.Connection, _ layer4.Handler) error {
 	return nil
 }
 
-// packetProxyProtocolConn sends every message prepended with proxy protocol
+// packetProxyProtocolConn prepends the PROXY protocol header to the FIRST
+// datagram of a packet ("UDP") upstream connection, then passes every
+// subsequent datagram through unmodified.
+//
+// The header is sent exactly once per connection because that is what PROXY
+// protocol receivers expect — including this module's own l4proxyprotocol
+// reader, which parses the header on the first read of the connection and
+// treats everything after as payload. Prepending the header to every datagram
+// (the previous behavior) corrupts every datagram after the first: the receiver
+// strips the header only once, so datagrams 2..N arrive with an unexpected
+// header still attached. For a proxied QUIC/HTTP-3 flow that silently breaks the
+// handshake — the Initial may get through but the follow-up packets do not, so
+// the handshake stalls and times out.
 type packetProxyProtocolConn struct {
 	net.Conn
 	header io.WriterTo // both of the pp header types implement this interface
+	sent   bool        // whether the header has been written (writes are serialized per conn)
 }
 
 func (pp *packetProxyProtocolConn) Write(p []byte) (int, error) {
-	// TODO: pool the buffer
+	if pp.sent {
+		return pp.Conn.Write(p)
+	}
+	// First datagram: send the PROXY protocol header and the payload together in
+	// a single datagram so the receiver reads the header and the first payload
+	// bytes atomically. TODO: pool the buffer.
 	buf := new(bytes.Buffer)
-	// send pp and payload in a single message
-	_, _ = pp.header.WriteTo(buf)
-	buf.Write(p)
-	_, err := buf.WriteTo(pp.Conn)
-	if err != nil {
+	if _, err := pp.header.WriteTo(buf); err != nil {
 		return 0, err
 	}
+	buf.Write(p)
+	if _, err := buf.WriteTo(pp.Conn); err != nil {
+		return 0, err
+	}
+	// Only latch after a successful write so a failed first datagram can be
+	// retried with the header still attached.
+	pp.sent = true
 	return len(p), nil
 }
 
