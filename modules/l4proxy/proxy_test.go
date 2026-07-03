@@ -1,8 +1,11 @@
 package l4proxy
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"testing"
@@ -10,6 +13,7 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/mholt/caddy-l4/layer4"
+	"github.com/pires/go-proxyproto"
 	"go.uber.org/zap"
 )
 
@@ -494,5 +498,83 @@ func TestActiveHealthCheckUsesLocalAddress(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("no health check connection observed")
+	}
+}
+
+// capturingConn records each Write as a distinct "datagram" (one Write == one
+// UDP send), so a test can assert per-datagram framing.
+type capturingConn struct {
+	net.Conn
+	writes [][]byte
+}
+
+func (c *capturingConn) Write(p []byte) (int, error) {
+	b := make([]byte, len(p))
+	copy(b, p)
+	c.writes = append(c.writes, b)
+	return len(p), nil
+}
+
+// TestPacketProxyProtocolConnSendsHeaderOncePerConn guards the fix for the
+// per-datagram PROXY-header bug: on a packet ("UDP") upstream, the PROXY
+// protocol header must be prepended to the FIRST datagram only, with every
+// later datagram sent raw. Prepending it to every datagram corrupts datagrams
+// 2..N (the receiver strips the header only once) and silently stalls a proxied
+// QUIC/HTTP-3 handshake.
+func TestPacketProxyProtocolConnSendsHeaderOncePerConn(t *testing.T) {
+	src := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44321}
+	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8443}
+	header := proxyproto.HeaderProxyFromAddrs(2, src, dst)
+	if header == nil {
+		t.Fatal("expected non-nil PROXY v2 header")
+	}
+	header.Command = proxyproto.PROXY
+
+	cc := &capturingConn{}
+	pp := &packetProxyProtocolConn{Conn: cc, header: header}
+
+	payloads := [][]byte{
+		[]byte("quic-initial-datagram"),
+		[]byte("quic-handshake-datagram"),
+		[]byte("quic-1rtt-datagram"),
+	}
+	for _, p := range payloads {
+		n, err := pp.Write(p)
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if n != len(p) {
+			t.Fatalf("short write: got %d want %d", n, len(p))
+		}
+	}
+
+	if len(cc.writes) != len(payloads) {
+		t.Fatalf("expected %d datagrams, got %d", len(payloads), len(cc.writes))
+	}
+
+	// First datagram: PROXY header + payload[0], recoverable by the same reader
+	// (pires/go-proxyproto) that receivers use.
+	r := bufio.NewReader(bytes.NewReader(cc.writes[0]))
+	got, err := proxyproto.Read(r)
+	if err != nil {
+		t.Fatalf("reading PROXY header from first datagram: %v", err)
+	}
+	if got.SourceAddr.String() != src.String() {
+		t.Fatalf("recovered source addr: got %s want %s", got.SourceAddr, src)
+	}
+	rest, _ := io.ReadAll(r)
+	if !bytes.Equal(rest, payloads[0]) {
+		t.Fatalf("first datagram payload after header: got %q want %q", rest, payloads[0])
+	}
+
+	// PROXY v2 12-byte signature; datagrams 2..N must NOT begin with it.
+	ppv2Sig := []byte("\r\n\r\n\x00\r\nQUIT\n")
+	for i := 1; i < len(payloads); i++ {
+		if !bytes.Equal(cc.writes[i], payloads[i]) {
+			t.Fatalf("datagram %d not sent raw: got %q want %q", i, cc.writes[i], payloads[i])
+		}
+		if bytes.HasPrefix(cc.writes[i], ppv2Sig) {
+			t.Fatalf("datagram %d unexpectedly carries a PROXY v2 header", i)
+		}
 	}
 }
