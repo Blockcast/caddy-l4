@@ -33,6 +33,11 @@ import (
 const (
 	idleTimeoutDefault     = 30 * time.Second
 	MatchingTimeoutDefault = 3 * time.Second
+	udpReadQueueSize       = 10
+	// Bound each virtual connection's queued storage to 45 KB of jumbo
+	// datagrams. UDP overload is shed per flow after this queue fills and
+	// recorded in metrics.
+	udpClientQueueSize = 5
 )
 
 // Server represents a Caddy layer4 server.
@@ -54,11 +59,17 @@ type Server struct {
 	logger        *zap.Logger
 	listenAddrs   []caddy.NetworkAddress
 	compiledRoute Handler
+	metrics       *serverMetrics
 }
 
 // Provision sets up the server.
 func (s *Server) Provision(ctx caddy.Context, logger *zap.Logger) error {
 	s.logger = logger
+	metrics, err := newServerMetrics(ctx.GetMetricsRegistry())
+	if err != nil {
+		return err
+	}
+	s.metrics = metrics
 
 	if s.IdleTimeout <= 0 {
 		s.IdleTimeout = caddy.Duration(idleTimeoutDefault)
@@ -78,8 +89,7 @@ func (s *Server) Provision(ctx caddy.Context, logger *zap.Logger) error {
 		s.listenAddrs = append(s.listenAddrs, addr)
 	}
 
-	err := s.Routes.Provision(ctx)
-	if err != nil {
+	if err := s.Routes.Provision(ctx); err != nil {
 		return err
 	}
 	s.compiledRoute = s.Routes.Compile(s.logger, time.Duration(s.MatchingTimeout), nopHandler{})
@@ -105,12 +115,13 @@ func (s *Server) serve(ln net.Listener) error {
 func (s *Server) servePacket(pc net.PacketConn) error {
 	// Spawn a goroutine whose only job is to consume packets from the socket
 	// and send to the packets channel.
-	packets := make(chan packet, 10)
+	packets := make(chan packet, udpReadQueueSize)
 	go func(packets chan packet) {
 		for {
 			buf := udpBufPool.Get().([]byte)
 			n, addr, err := pc.ReadFrom(buf)
 			if err != nil {
+				udpBufPool.Put(buf)
 				var netErr net.Error
 				if errors.As(err, &netErr) && netErr.Timeout() {
 					continue
@@ -132,25 +143,19 @@ func (s *Server) servePacket(pc net.PacketConn) error {
 	// closeCh is used to receive notifications of socket closures from
 	// packetConn, which allows us to remove stale connections (whose
 	// proxy handlers have completed) from the udpConns map.
-	closeCh := make(chan string, 10)
+	closeCh := make(chan *packetConn, 10)
+	done := make(chan struct{})
+	defer close(done)
 	for {
 		select {
-		case addr := <-closeCh:
-			conn, ok := udpConns[addr]
-			if ok {
-				// This will abort any active Read() from another goroutine and return EOF
-				close(conn.readCh)
-				// Drain pending packets to ensure we release buffers back to the pool
-				for pkt := range conn.readCh {
-					udpBufPool.Put(pkt.pooledBuf)
-				}
-			}
-			// UDP connection is closed (either implicitly through timeout or by
-			// explicit call to Close()).
-			delete(udpConns, addr)
+		case conn := <-closeCh:
+			removePacketConn(udpConns, conn)
 
 		case pkt := <-packets:
 			if pkt.err != nil {
+				for _, conn := range udpConns {
+					removePacketConn(udpConns, conn)
+				}
 				return pkt.err
 			}
 			conn, ok := udpConns[pkt.addr.String()]
@@ -159,9 +164,10 @@ func (s *Server) servePacket(pc net.PacketConn) error {
 				// Create one now.
 				conn = &packetConn{
 					PacketConn:  pc,
-					readCh:      make(chan *packet, 5),
+					readCh:      make(chan *packet, udpClientQueueSize),
 					addr:        pkt.addr,
 					closeCh:     closeCh,
+					done:        done,
 					idleTimeout: time.Duration(s.IdleTimeout),
 				}
 				udpConns[pkt.addr.String()] = conn
@@ -175,9 +181,34 @@ func (s *Server) servePacket(pc net.PacketConn) error {
 					// the old one shutting down.
 				}(conn)
 			}
-			conn.readCh <- &pkt
+			// UDP is allowed to shed datagrams under overload. Do so only after
+			// classifying the flow: one slow client must not block this dispatcher
+			// or consume unbounded memory on the shared socket.
+			select {
+			case conn.readCh <- &pkt:
+			default:
+				udpBufPool.Put(pkt.pooledBuf)
+				s.metrics.packetDropped()
+			}
 		}
 	}
+}
+
+// removePacketConn retires conn only if it is still the active generation for
+// its downstream address. A delayed close from an old generation must not tear
+// down a replacement connection which reused the same address and port.
+func removePacketConn(udpConns map[string]*packetConn, conn *packetConn) {
+	key := conn.addr.String()
+	if udpConns[key] != conn {
+		return
+	}
+
+	// This aborts any active Read and releases queued packet buffers.
+	close(conn.readCh)
+	for pkt := range conn.readCh {
+		udpBufPool.Put(pkt.pooledBuf)
+	}
+	delete(udpConns, key)
 }
 
 func (s *Server) handle(conn net.Conn) {
@@ -267,9 +298,11 @@ type packet struct {
 
 type packetConn struct {
 	net.PacketConn
-	addr    net.Addr
-	readCh  chan *packet
-	closeCh chan string
+	addr      net.Addr
+	readCh    chan *packet
+	closeCh   chan *packetConn
+	done      <-chan struct{}
+	closeOnce sync.Once
 	// If not nil, then the previous Read() call didn't consume all the data
 	// from the buffer, and this packet will be reused in the next Read()
 	// without waiting for readCh.
@@ -364,7 +397,7 @@ func (pc *packetConn) Read(b []byte) (n int, err error) {
 	// Although Close() also does this, we inform the server loop early about
 	// the closure to ensure that if any new packets are received from this
 	// connection in the meantime, a new handler will be started.
-	pc.closeCh <- pc.addr.String()
+	pc.notifyClose()
 	// Returning EOF here ensures that io.Copy() waiting on the downstream for
 	// reads will terminate.
 	return 0, io.EOF
@@ -382,10 +415,19 @@ func (pc *packetConn) Close() error {
 	// We may have already done this earlier in Read(), but just in case
 	// Read() wasn't being called, (re-)notify server loop we're closed.
 	// Server loop is responsible to close readCh to abort Read() to avoid race.
-	pc.closeCh <- pc.addr.String()
+	pc.notifyClose()
 	// We don't call net.PacketConn.Close() here as we would stop the UDP
 	// server.
 	return nil
+}
+
+func (pc *packetConn) notifyClose() {
+	pc.closeOnce.Do(func() {
+		select {
+		case pc.closeCh <- pc:
+		case <-pc.done:
+		}
+	})
 }
 
 func (pc *packetConn) RemoteAddr() net.Addr { return pc.addr }
