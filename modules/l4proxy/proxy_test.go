@@ -695,66 +695,181 @@ func (c *capturingConn) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// TestPacketProxyProtocolConnSendsHeaderOncePerConn guards the fix for the
-// per-datagram PROXY-header bug: on a packet ("UDP") upstream, the PROXY
-// protocol header must be prepended to the FIRST datagram only, with every
-// later datagram sent raw. Prepending it to every datagram corrupts datagrams
-// 2..N (the receiver strips the header only once) and silently stalls a proxied
-// QUIC/HTTP-3 handshake.
-func TestPacketProxyProtocolConnSendsHeaderOncePerConn(t *testing.T) {
+// ppv2Sig is the 12-byte PROXY protocol v2 signature.
+var ppv2Sig = []byte("\r\n\r\n\x00\r\nQUIT\n")
+
+// readPPv2 parses one PROXY header off b and returns its source address and
+// the remaining bytes.
+func readPPv2(t *testing.T, b []byte) (string, []byte) {
+	t.Helper()
+	r := bufio.NewReader(bytes.NewReader(b))
+	h, err := proxyproto.Read(r)
+	if err != nil {
+		t.Fatalf("reading PROXY header: %v", err)
+	}
+	rest, _ := io.ReadAll(r)
+	return h.SourceAddr.String(), rest
+}
+
+// On a packet ("UDP") upstream every datagram carries its own PROXY header, so
+// a stateless receiver can attribute any datagram regardless of order or loss.
+func TestPacketProxyProtocolConnSendsHeaderPerDatagram(t *testing.T) {
 	src := &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 44321}
 	dst := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8443}
 	header := proxyproto.HeaderProxyFromAddrs(2, src, dst)
-	if header == nil {
-		t.Fatal("expected non-nil PROXY v2 header")
-	}
 	header.Command = proxyproto.PROXY
 
 	cc := &capturingConn{}
 	pp := &packetProxyProtocolConn{Conn: cc, header: header}
 
-	payloads := [][]byte{
-		[]byte("quic-initial-datagram"),
-		[]byte("quic-handshake-datagram"),
-		[]byte("quic-1rtt-datagram"),
-	}
+	payloads := []string{"quic-initial", "quic-handshake", "quic-1rtt"}
 	for _, p := range payloads {
-		n, err := pp.Write(p)
-		if err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		if n != len(p) {
-			t.Fatalf("short write: got %d want %d", n, len(p))
+		if n, err := pp.Write([]byte(p)); err != nil || n != len(p) {
+			t.Fatalf("write %q: n=%d err=%v", p, n, err)
 		}
 	}
-
 	if len(cc.writes) != len(payloads) {
 		t.Fatalf("expected %d datagrams, got %d", len(payloads), len(cc.writes))
 	}
+	for i, w := range cc.writes {
+		gotSrc, rest := readPPv2(t, w)
+		if gotSrc != src.String() {
+			t.Fatalf("datagram %d source: got %s want %s", i, gotSrc, src)
+		}
+		if string(rest) != payloads[i] {
+			t.Fatalf("datagram %d payload: got %q want %q", i, rest, payloads[i])
+		}
+	}
+}
 
-	// First datagram: PROXY header + payload[0], recoverable by the same reader
-	// (pires/go-proxyproto) that receivers use.
-	r := bufio.NewReader(bytes.NewReader(cc.writes[0]))
-	got, err := proxyproto.Read(r)
+// End to end through dialPeers: a UDP upstream receives a PROXY v2 header on
+// every datagram, carrying the downstream client address.
+func TestDialPeersUDPProxyProtocolHeaderPerDatagram(t *testing.T) {
+	upPC, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("reading PROXY header from first datagram: %v", err)
+		t.Fatal(err)
 	}
-	if got.SourceAddr.String() != src.String() {
-		t.Fatalf("recovered source addr: got %s want %s", got.SourceAddr, src)
-	}
-	rest, _ := io.ReadAll(r)
-	if !bytes.Equal(rest, payloads[0]) {
-		t.Fatalf("first datagram payload after header: got %q want %q", rest, payloads[0])
-	}
+	defer upPC.Close()
 
-	// PROXY v2 12-byte signature; datagrams 2..N must NOT begin with it.
-	ppv2Sig := []byte("\r\n\r\n\x00\r\nQUIT\n")
-	for i := 1; i < len(payloads); i++ {
-		if !bytes.Equal(cc.writes[i], payloads[i]) {
-			t.Fatalf("datagram %d not sent raw: got %q want %q", i, cc.writes[i], payloads[i])
+	// A connected UDP socket stands in for the downstream client flow.
+	clientPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientPC.Close()
+	downUDP, err := net.DialUDP("udp", nil, clientPC.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer downUDP.Close()
+
+	parsed, err := caddy.ParseNetworkAddress("udp/" + upPC.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{logger: zap.NewNop(), proxyProtocolVersion: 2}
+	upstream := &Upstream{peers: []*peer{{address: &parsed}}}
+	down := layer4.WrapConnection(downUDP, nil, h.logger)
+	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
+
+	upConns, err := h.dialPeers(upstream, repl, down)
+	if err != nil {
+		t.Fatalf("dialPeers: %v", err)
+	}
+	defer upConns[0].Close()
+
+	payloads := []string{"one", "two", "three"}
+	for _, p := range payloads {
+		if _, err := upConns[0].Write([]byte(p)); err != nil {
+			t.Fatal(err)
 		}
-		if bytes.HasPrefix(cc.writes[i], ppv2Sig) {
-			t.Fatalf("datagram %d unexpectedly carries a PROXY v2 header", i)
+	}
+	buf := make([]byte, 2048)
+	for i, want := range payloads {
+		_ = upPC.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := upPC.ReadFrom(buf)
+		if err != nil {
+			t.Fatalf("datagram %d: %v", i, err)
 		}
+		gotSrc, rest := readPPv2(t, buf[:n])
+		if gotSrc != downUDP.RemoteAddr().String() {
+			t.Fatalf("datagram %d source: got %s want %s", i, gotSrc, downUDP.RemoteAddr())
+		}
+		if string(rest) != want {
+			t.Fatalf("datagram %d payload: got %q want %q", i, rest, want)
+		}
+	}
+}
+
+// TCP upstreams are unchanged: the PROXY header is written once at the start
+// of the stream, never in front of later writes.
+func TestDialPeersTCPProxyProtocolHeaderOnce(t *testing.T) {
+	upLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upLn.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, _ := upLn.Accept()
+		accepted <- c
+	}()
+
+	// A real TCP pair for the downstream so the header has TCP addresses.
+	downLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer downLn.Close()
+	client, err := net.Dial("tcp", downLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	downTCP, err := downLn.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer downTCP.Close()
+
+	parsed, err := caddy.ParseNetworkAddress(upLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{logger: zap.NewNop(), proxyProtocolVersion: 2}
+	upstream := &Upstream{peers: []*peer{{address: &parsed}}}
+	down := layer4.WrapConnection(downTCP, nil, h.logger)
+	repl := down.Context.Value(layer4.ReplacerCtxKey).(*caddy.Replacer)
+
+	upConns, err := h.dialPeers(upstream, repl, down)
+	if err != nil {
+		t.Fatalf("dialPeers: %v", err)
+	}
+	if _, ok := upConns[0].(*packetProxyProtocolConn); ok {
+		t.Fatal("TCP upstream must not be wrapped in the per-datagram writer")
+	}
+	for _, p := range []string{"first", "second"} {
+		if _, err := upConns[0].Write([]byte(p)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	upConns[0].Close()
+
+	srv := <-accepted
+	defer srv.Close()
+	_ = srv.SetReadDeadline(time.Now().Add(2 * time.Second))
+	all, err := io.ReadAll(srv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(all, ppv2Sig) != 1 {
+		t.Fatalf("expected exactly one PROXY v2 header, stream: %q", all)
+	}
+	gotSrc, rest := readPPv2(t, all)
+	if gotSrc != client.LocalAddr().String() {
+		t.Fatalf("source: got %s want %s", gotSrc, client.LocalAddr())
+	}
+	if string(rest) != "firstsecond" {
+		t.Fatalf("payload: got %q want %q", rest, "firstsecond")
 	}
 }
