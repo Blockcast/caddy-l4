@@ -222,32 +222,21 @@ func (h *Handler) Handle(down *layer4.Connection, _ layer4.Handler) error {
 	return nil
 }
 
-// packetProxyProtocolConn prepends the PROXY protocol header to the FIRST
-// datagram of a packet ("UDP") upstream connection, then passes every
-// subsequent datagram through unmodified.
+// packetProxyProtocolConn prepends the PROXY protocol header to EVERY datagram
+// of a packet ("UDP") upstream connection.
 //
-// The header is sent exactly once per connection because that is what PROXY
-// protocol receivers expect — including this module's own l4proxyprotocol
-// reader, which parses the header on the first read of the connection and
-// treats everything after as payload. Prepending the header to every datagram
-// (the previous behavior) corrupts every datagram after the first: the receiver
-// strips the header only once, so datagrams 2..N arrive with an unexpected
-// header still attached. For a proxied QUIC/HTTP-3 flow that silently breaks the
-// handshake — the Initial may get through but the follow-up packets do not, so
-// the handshake stalls and times out.
+// Datagrams are independent: a receiver may see any of them first, lose some,
+// or be a stateless per-packet parser (the relay's ProxySocket wrapper), so each
+// datagram carries its own header. Receivers must strip one header per datagram;
+// this module's own proxy_protocol handler does so for packet connections.
+// Stream (TCP/unix) upstreams are unaffected: dialPeers writes their header once.
 type packetProxyProtocolConn struct {
 	net.Conn
 	header io.WriterTo // both of the pp header types implement this interface
-	sent   bool        // whether the header has been written (writes are serialized per conn)
 }
 
 func (pp *packetProxyProtocolConn) Write(p []byte) (int, error) {
-	if pp.sent {
-		return pp.Conn.Write(p)
-	}
-	// First datagram: send the PROXY protocol header and the payload together in
-	// a single datagram so the receiver reads the header and the first payload
-	// bytes atomically. TODO: pool the buffer.
+	// Header and payload go out in a single datagram. TODO: pool the buffer.
 	buf := new(bytes.Buffer)
 	if _, err := pp.header.WriteTo(buf); err != nil {
 		return 0, err
@@ -256,9 +245,6 @@ func (pp *packetProxyProtocolConn) Write(p []byte) (int, error) {
 	if _, err := buf.WriteTo(pp.Conn); err != nil {
 		return 0, err
 	}
-	// Only latch after a successful write so a failed first datagram can be
-	// retried with the header still attached.
-	pp.sent = true
 	return len(p), nil
 }
 
