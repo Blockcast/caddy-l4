@@ -18,28 +18,18 @@ env:
 jobs:
   # From https://github.com/golangci/golangci-lint-action
   golangci:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read # for actions/checkout to fetch code
       pull-requests: read # for golangci/golangci-lint-action to fetch pull requests
     name: lint
     strategy:
       matrix:
-        os:
-          - linux
-          - mac
-          - windows
+        os: [linux]
 
-        include:
-          - os: linux
-            OS_LABEL: ubuntu-latest
-
-          - os: mac
-            OS_LABEL: macos-14
-
-          - os: windows
-            OS_LABEL: windows-latest
-
-    runs-on: ${{ matrix.OS_LABEL }}
+    runs-on:
+      group: default-tools
+      labels: arc-light
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
@@ -50,7 +40,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-go@faf52423ec0d44c58f68e83b614bfcd99dded66f # v5.5.0
         with:
-          go-version: '~1.25'
+          go-version: '~1.26'
           check-latest: true
 
       - name: golangci-lint
@@ -65,10 +55,13 @@ jobs:
           # only-new-issues: true
 
   govulncheck:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       pull-requests: read
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-light
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -78,11 +71,17 @@ jobs:
       - name: govulncheck
         uses: golang/govulncheck-action@b625fbe08f3bccbe446d94fbf87fcc875a4f50ee # v1.0.4
         with:
-          go-version-input: '~1.25.0'
+          go-version-input: '~1.26.0'
           check-latest: true
 
   dependency-review:
-    runs-on: ubuntu-latest
+    # GitHub has no dependency graph for this repository, so the action
+    # cannot produce a useful result and fails before reviewing the diff.
+    # Keep the check visible as skipped until the graph is available.
+    if: false
+    runs-on:
+      group: default-tools
+      labels: arc-light
     permissions:
       contents: read
       pull-requests: write

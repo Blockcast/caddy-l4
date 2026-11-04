@@ -11,30 +11,22 @@ on:
 
 jobs:
   build-test-check:
-    runs-on: ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on:
+      group: default-tools
+      labels: arc-light
     strategy:
       # Default is true, cancels jobs for other platforms in the matrix if one fails
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
         go-version:
-          - "1.25"
-
-        include:
-          - os: ubuntu-latest
-            urlTemplate: "https://github.com/caddyserver/xcaddy/releases/download/{{version}}/xcaddy_{{rawVersion}}_linux_amd64.tar.gz"
-            name: "xcaddy"
-            pathInArchive: "xcaddy"
-
-          - os: "macos-latest"
-            urlTemplate: "https://github.com/caddyserver/xcaddy/releases/download/{{version}}/xcaddy_{{rawVersion}}_mac_amd64.tar.gz"
-            name: "xcaddy"
-            pathInArchive: "xcaddy"
-
-          - os: "windows-latest"
-            urlTemplate: "https://github.com/caddyserver/xcaddy/releases/download/{{version}}/xcaddy_{{rawVersion}}_windows_amd64.zip"
-            name: "xcaddy.exe"
-            pathInArchive: "xcaddy.exe"
+          - "1.26"
+        urlTemplate:
+          - "https://github.com/caddyserver/xcaddy/releases/download/{{version}}/xcaddy_{{rawVersion}}_linux_amd64.tar.gz"
+        name:
+          - "xcaddy"
+        pathInArchive:
+          - "xcaddy"
 
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
