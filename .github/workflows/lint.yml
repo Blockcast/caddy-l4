@@ -49,7 +49,9 @@ jobs:
           version: latest
 
           # Windows times out frequently after about 5m50s if we don't set a longer timeout.
-          args: --timeout 10m
+          # On arc-light a cold module cache needs more than 10m just to load packages, and
+          # setup-go only saves that cache after a green run, so 10m never warms it.
+          args: --timeout 25m
 
           # Optional: show only new issues if it's a pull request. The default value is `false`.
           # only-new-issues: true
