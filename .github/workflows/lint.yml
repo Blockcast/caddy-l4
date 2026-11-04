@@ -31,15 +31,13 @@ jobs:
 
         include:
           - os: linux
-            OS_LABEL: ubuntu-latest
-
           - os: mac
             OS_LABEL: macos-14
 
           - os: windows
             OS_LABEL: windows-latest
 
-    runs-on: ${{ matrix.OS_LABEL }}
+    runs-on: ${{ matrix.os == 'linux' && fromJSON('{"group":"default-tools","labels":"arc-light"}') || matrix.OS_LABEL }}
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
@@ -68,7 +66,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-light
     steps:
       - name: Harden the runner (Audit all outbound calls)
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -82,7 +82,9 @@ jobs:
           check-latest: true
 
   dependency-review:
-    runs-on: ubuntu-latest
+    runs-on:
+      group: default-tools
+      labels: arc-light
     permissions:
       contents: read
       pull-requests: write

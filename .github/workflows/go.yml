@@ -11,17 +11,17 @@ on:
 
 jobs:
   build-test-check:
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.os == 'linux' && fromJSON('{"group":"default-tools","labels":"arc-light"}') || matrix.os }}
     strategy:
       # Default is true, cancels jobs for other platforms in the matrix if one fails
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest, ubuntu-latest]
+        os: [macos-latest, windows-latest, linux]
         go-version:
           - "1.25"
 
         include:
-          - os: ubuntu-latest
+          - os: linux
             urlTemplate: "https://github.com/caddyserver/xcaddy/releases/download/{{version}}/xcaddy_{{rawVersion}}_linux_amd64.tar.gz"
             name: "xcaddy"
             pathInArchive: "xcaddy"
