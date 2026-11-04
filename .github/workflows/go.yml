@@ -20,7 +20,7 @@ jobs:
       fail-fast: false
       matrix:
         go-version:
-          - "1.25"
+          - "1.26"
         urlTemplate:
           - "https://github.com/caddyserver/xcaddy/releases/download/{{version}}/xcaddy_{{rawVersion}}_linux_amd64.tar.gz"
         name:
