@@ -75,7 +75,10 @@ jobs:
           check-latest: true
 
   dependency-review:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # GitHub has no dependency graph for this repository, so the action
+    # cannot produce a useful result and fails before reviewing the diff.
+    # Keep the check visible as skipped until the graph is available.
+    if: false
     runs-on:
       group: default-tools
       labels: arc-light
