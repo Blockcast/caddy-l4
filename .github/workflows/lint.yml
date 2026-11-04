@@ -18,6 +18,7 @@ env:
 jobs:
   # From https://github.com/golangci/golangci-lint-action
   golangci:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read # for actions/checkout to fetch code
       pull-requests: read # for golangci/golangci-lint-action to fetch pull requests
@@ -54,6 +55,7 @@ jobs:
           # only-new-issues: true
 
   govulncheck:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       pull-requests: read
@@ -73,6 +75,7 @@ jobs:
           check-latest: true
 
   dependency-review:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on:
       group: default-tools
       labels: arc-light
