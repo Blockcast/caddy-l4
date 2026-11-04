@@ -24,20 +24,11 @@ jobs:
     name: lint
     strategy:
       matrix:
-        os:
-          - linux
-          - mac
-          - windows
+        os: [linux]
 
-        include:
-          - os: linux
-          - os: mac
-            OS_LABEL: macos-14
-
-          - os: windows
-            OS_LABEL: windows-latest
-
-    runs-on: ${{ matrix.os == 'linux' && fromJSON('{"group":"default-tools","labels":"arc-light"}') || matrix.OS_LABEL }}
+    runs-on:
+      group: default-tools
+      labels: arc-light
 
     steps:
       - name: Harden the runner (Audit all outbound calls)
