@@ -18,6 +18,7 @@ env:
 jobs:
   # From https://github.com/golangci/golangci-lint-action
   golangci:
+    timeout-minutes: 25
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read # for actions/checkout to fetch code
@@ -57,6 +58,7 @@ jobs:
           # only-new-issues: true
 
   govulncheck:
+    timeout-minutes: 25
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
@@ -77,6 +79,7 @@ jobs:
           check-latest: true
 
   dependency-review:
+    timeout-minutes: 25
     # GitHub has no dependency graph for this repository, so the action
     # cannot produce a useful result and fails before reviewing the diff.
     # Keep the check visible as skipped until the graph is available.
