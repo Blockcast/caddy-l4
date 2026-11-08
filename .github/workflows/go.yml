@@ -33,11 +33,20 @@ jobs:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
     - name: Set up Go
+      id: setup-go
       uses: actions/setup-go@v6
       with:
         check-latest: true
-        cache: true
+        cache: false
         go-version: ${{ matrix.go-version }}
+
+    - name: Restore Go cache
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: setup-go-${{ runner.os }}-${{ runner.arch }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
 
     - name: Set up xcaddy
       uses: engineerd/configurator@v0.0.10
@@ -84,3 +93,12 @@ jobs:
         # modules/l4xmpp needs their test files.
 
         go test -v ./...
+
+    - name: Save Go cache
+      if: ${{ success() && (github.event_name == 'push' || github.event_name == 'schedule') && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: |
+          ~/go/pkg/mod
+          ~/.cache/go-build
+        key: setup-go-${{ runner.os }}-${{ runner.arch }}-go-${{ steps.setup-go.outputs.go-version }}-${{ hashFiles('**/go.sum') }}
