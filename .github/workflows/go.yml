@@ -13,9 +13,7 @@ jobs:
   build-test-check:
     timeout-minutes: 135
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on:
-      group: default-tools
-      labels: arc-light
+    runs-on: ubuntu-latest
     strategy:
       # Default is true, cancels jobs for other platforms in the matrix if one fails
       fail-fast: false
