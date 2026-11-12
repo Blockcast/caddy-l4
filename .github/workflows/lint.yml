@@ -48,6 +48,7 @@ jobs:
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: latest
+          skip-save-cache: ${{ github.event_name != 'push' && github.event_name != 'schedule' || (github.ref != 'refs/heads/main' && github.ref != 'refs/heads/master') }}
 
           # Windows times out frequently after about 5m50s if we don't set a longer timeout.
           # On arc-light a cold module cache needs more than 10m just to load packages, and
